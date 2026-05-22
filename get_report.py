@@ -244,12 +244,24 @@ def write_to_sheet(sheet_target_name, messages):
 def get_driver():
     options = uc.ChromeOptions()
     options.add_argument("--headless=new")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ) # Cập nhật User-Agent mới nhất của Chrome 120 để tránh bị nhận diện là bot
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.page_load_strategy = "eager"
     options.add_argument("--lang=en-GB")
+    
+    prefs = {"profile.cookie_controls_mode": 0,
+        "credentials_enable_service": False,      # Tắt popup hỏi lưu pass
+        "profile.password_manager_enabled": False # Tắt trình quản lý mật khẩu
+    } 
+
+    options.add_experimental_option("prefs", prefs)
 
     proxy_url = os.getenv("PROXY_URL")
     if proxy_url:
@@ -285,6 +297,11 @@ def get_driver():
             window.navigator.chrome = { runtime: {} };
             Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
             Object.defineProperty(navigator, 'languages', { get: () => ['en-GB', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'credentials', {
+                get: () => undefined
+            });
+
+            window.PublicKeyCredential = undefined;
         """},
     )
 
