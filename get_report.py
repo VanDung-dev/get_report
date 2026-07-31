@@ -23,12 +23,8 @@ import subprocess
 import re
 
 
-# Tự động nạp file .env từ thư mục hiện tại hoặc thư mục get_message nếu chưa có
-load_dotenv(find_dotenv(usecwd=True))
-if not os.getenv("TEAMS_EMAIL"):
-    parent_env = os.path.join("..", "get_message", ".env")
-    if os.path.exists(parent_env):
-        load_dotenv(parent_env)
+# Tự động tìm và nạp file .env ở thư mục hiện tại hoặc thư mục cha
+load_dotenv(find_dotenv())
 
 # =========================
 # PATCH UNDETECTED CHROMEDRIVER CLEANUP
