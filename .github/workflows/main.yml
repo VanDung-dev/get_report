@@ -25,7 +25,7 @@ jobs:
 
       - name: Run the main script
         env:
-          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          GCP_SA_KEY: ${{ secrets.GOOGLE_CREDENTIALS }}
           TEAMS_EMAIL: ${{ secrets.TEAMS_EMAIL }}
           TEAMS_PASSWORD: ${{ secrets.TEAMS_PASSWORD }}
         run: python get_report.py
