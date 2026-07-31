@@ -209,3 +209,5 @@ __marimo__/
 #custom
 *.pkl
 credentials.json
+
+.png

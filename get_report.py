@@ -1,27 +1,54 @@
-import datetime
-from dotenv import load_dotenv
-import pytz
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from dateutil import parser
+import os
 import re
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-import undetected_chromedriver as uc
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 import time
 import json
-import os
+import datetime
+import pytz
+from dateutil import parser
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+import gspread
+from google.auth import default
+from google.oauth2.service_account import Credentials
 
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+import undetected_chromedriver as uc
+
+import platform
+import subprocess
+import re
+
+
+# Tự động nạp file .env từ thư mục hiện tại hoặc thư mục get_message nếu chưa có
+load_dotenv(find_dotenv(usecwd=True))
+if not os.getenv("TEAMS_EMAIL"):
+    parent_env = os.path.join("..", "get_message", ".env")
+    if os.path.exists(parent_env):
+        load_dotenv(parent_env)
+
+# =========================
+# PATCH UNDETECTED CHROMEDRIVER CLEANUP
+# =========================
+# Sửa lỗi OSError: [WinError 6] The handle is invalid khi Python giải phóng bộ nhớ (garbage collection)
+def _patch_uc_del():
+    def _safe_del(self):
+        try:
+            self.quit()
+        except Exception:
+            pass
+    uc.Chrome.__del__ = _safe_del
+
+_patch_uc_del()
+
+# =========================
+# CONFIG
+# =========================
 email = os.environ.get("TEAMS_EMAIL")
 password = os.environ.get("TEAMS_PASSWORD")
-gcp_credentials_json = os.environ.get("GCP_SA_KEY")
 chat = "GetReport"
 local_tz = pytz.timezone("Asia/Ho_Chi_Minh")
 SPREADSHEET_ID = "1_m7s-1-I-SOFfzlWe7CBf5fstFir7qXYAKW4j-8hKYM"
@@ -30,22 +57,65 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Khởi tạo kết nối
-creds_dict = json.loads(gcp_credentials_json)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SCOPES)
-client = gspread.authorize(creds)
-print(f"Spreadsheet ID: {SPREADSHEET_ID}")
-spreadsheet = client.open_by_key(SPREADSHEET_ID)
-
-# Lấy danh sách TẤT CẢ sheet (Đã bỏ [:-1] để không bị sót nhân viên)
-sheet_names = [s.title for s in spreadsheet.worksheets()]
-
 MESSAGE_PATTERN = re.compile(r".*\+\s*(\d+)/.*", re.IGNORECASE | re.DOTALL)
+
+
+# =========================
+# GOOGLE SHEETS AUTHENTICATION
+# =========================
+def get_gspread_client(credentials_path="gcp-credentials.json"):
+    """Khởi tạo và xác thực kết nối với Google Sheets API linh hoạt từ nhiều nguồn."""
+    # 1. Ưu tiên đọc từ các biến môi trường dạng JSON trong file .env
+    env_json = (
+        os.getenv("GCP_SA_KEY")
+        or os.getenv("GCP_CREDENTIALS_JSON")
+        or os.getenv("GOOGLE_CREDENTIALS")
+    )
+    if env_json and env_json.strip().startswith("{"):
+        try:
+            info = json.loads(env_json)
+            creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+            return gspread.authorize(creds)
+        except Exception as e:
+            print(f"⚠️ Lỗi đọc credentials từ biến môi trường: {e}")
+
+    # 2. Đọc từ file JSON trên ổ đĩa (thử nhiều đường dẫn bao gồm file gcp-credentials.json ở thư mục get_message)
+    possible_paths = [
+        credentials_path,
+        credentials_path + ".json",
+        "gcp-credentials.json",
+        "gcp-credentials.json.json",
+        "credentials.json",
+        os.path.join("..", "get_message", "gcp-credentials.json"),
+        os.path.join("..", "get_message", "gcp-credentials.json.json"),
+    ]
+
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                creds = Credentials.from_service_account_file(path, scopes=SCOPES)
+                return gspread.authorize(creds)
+            except Exception as e:
+                print(f"⚠️ Lỗi đọc file credentials '{path}': {e}")
+
+    # 3. Thử dùng default credentials
+    try:
+        creds, _ = default()
+        return gspread.authorize(creds)
+    except Exception as e:
+        raise FileNotFoundError(
+            "Không thể khởi tạo kết nối Google Sheets API. "
+            "Vui lòng cấu hình biến GCP_SA_KEY / GCP_CREDENTIALS_JSON trong file .env hoặc thêm file 'gcp-credentials.json' vào thư mục."
+        ) from e
 
 
 def display_screenshot(driver: webdriver.Chrome, file_name: str = "screenshot.png"):
     """Chụp màn hình và hiển thị"""
-    driver.save_screenshot(file_name)
+    try:
+        driver.save_screenshot(file_name)
+        print(f"📸 Đã lưu ảnh màn hình '{file_name}'")
+    except Exception as e:
+        print(f"❌ Không thể lưu ảnh màn hình '{file_name}': {e}")
     time.sleep(3)
 
 
@@ -83,6 +153,7 @@ def open_chat(driver, chat_name):
         )
         display_screenshot(driver, "after_opening_chat.png")
     except Exception as e:
+        display_screenshot(driver, "open_chat_error.png")
         print(f"❌ Lỗi khi mở chat '{chat_name}': {e}")
 
 
@@ -136,7 +207,7 @@ def is_valid_message(content):
     return bool(MESSAGE_PATTERN.match(content))
 
 
-def get_filtered_messages(current_hour):
+def get_filtered_messages(spreadsheet, sheet_names, current_hour):
     tz = pytz.timezone("Asia/Ho_Chi_Minh")
     now = datetime.datetime.now(tz).replace(tzinfo=None)
 
@@ -202,7 +273,7 @@ def get_filtered_messages(current_hour):
     return messages
 
 
-def write_to_sheet(sheet_target_name, messages):
+def write_to_sheet(spreadsheet, sheet_names, sheet_target_name, messages):
     try:
         sheet_names_with_data = [name for name in sheet_names if messages.get(name)]
         if not sheet_names_with_data:
@@ -239,6 +310,41 @@ def write_to_sheet(sheet_target_name, messages):
 
     except Exception as e:
         print(f"❌ Lỗi khi ghi vào sheet {sheet_target_name}: {e}")
+# =========================
+# Kiểm tra version Chrome
+# =========================       
+def get_installed_chrome_major_version():
+    """Tự động kiểm tra Major Version của Chrome trên máy"""
+
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import winreg
+            # Đọc phiên bản Chrome từ Registry Windows
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Google\Chrome\BLBeacon")
+            except FileNotFoundError:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon")
+            version, _ = winreg.QueryValueEx(key, "version")
+            return int(version.split('.')[0])
+
+        elif system == "Linux":
+            output = subprocess.check_output(["google-chrome", "--version"]).decode("utf-8")
+            match = re.search(r"Google Chrome (\d+)\.", output)
+            if match:
+                return int(match.group(1))
+
+        elif system == "Darwin":  # macOS
+            cmd = r"/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --version"
+            output = subprocess.check_output(cmd, shell=True).decode("utf-8")
+            match = re.search(r"Google Chrome (\d+)\.", output)
+            if match:
+                return int(match.group(1))
+    except Exception as e:
+        print(f"⚠️ Không thể tự động phát hiện phiên bản Chrome: {e}")
+    
+    return None
+
 
 
 def get_driver():
@@ -248,7 +354,7 @@ def get_driver():
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/120.0.0.0 Safari/537.36"
-    ) # Cập nhật User-Agent mới nhất của Chrome 120 để tránh bị nhận diện là bot
+    )
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
@@ -256,9 +362,10 @@ def get_driver():
     options.page_load_strategy = "eager"
     options.add_argument("--lang=en-GB")
     
-    prefs = {"profile.cookie_controls_mode": 0,
-        "credentials_enable_service": False,      # Tắt popup hỏi lưu pass
-        "profile.password_manager_enabled": False # Tắt trình quản lý mật khẩu
+    prefs = {
+        "profile.cookie_controls_mode": 0,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False
     } 
 
     options.add_experimental_option("prefs", prefs)
@@ -272,19 +379,14 @@ def get_driver():
 
     chrome_version = None
     try:
-        # Lệnh này sẽ chạy thành công trên máy chủ Ubuntu của GitHub Actions
-        # Lấy output (ví dụ: "Google Chrome 147.0.7727.55")
         result = subprocess.check_output(["google-chrome", "--version"]).decode("utf-8")
-        # Dùng Regex để tách lấy con số đầu tiên (147)
         chrome_version = int(re.search(r"\d+", result).group(0))
         print(
             f"✅ Đã tự động nhận diện Chrome trên máy chủ là version: {chrome_version}"
         )
     except Exception:
-        # Nếu chạy thủ công trên Windows ở máy tính cá nhân nó sẽ nhảy vào đây
-        pass
+        chrome_version = get_installed_chrome_major_version()
 
-    # Khởi tạo Driver với đúng phiên bản máy chủ đang có
     if chrome_version:
         driver = uc.Chrome(options=options, version_main=chrome_version)
     else:
@@ -310,122 +412,182 @@ def get_driver():
 
 def login():
     driver = get_driver()
-    driver.get("https://teams.live.com/v2/")
+
+    # Truy cập link chuẩn cho Work/School
+    driver.get("https://teams.microsoft.com/")
     wait = WebDriverWait(driver, 30)
 
     try:
-        print("⏳ Đang tiến hành đăng nhập...")
-        sign_in_btn = wait.until(
-            EC.element_to_be_clickable((By.XPATH, '//button[contains(., "Sign in")]'))
-        )
-        sign_in_btn.click()
+        print("⏳ Đang đăng nhập...")
 
-        email_input = wait.until(
-            EC.presence_of_element_located((By.ID, "usernameEntry"))
-        )
-        email_input.send_keys(email)
-        email_input.send_keys(Keys.RETURN)
-        time.sleep(3)
-
+        # 1. Xử lý nút Sign in (nếu bị đẩy ra trang chờ)
         try:
-            use_pass_btn = WebDriverWait(driver, 10).until(
+            sign_btn = WebDriverWait(driver, 10).until(
                 EC.element_to_be_clickable(
-                    (By.XPATH, '//span[contains(text(), "Use your password")]')
+                    (
+                        By.XPATH,
+                        '//button[contains(., "Sign in")] | //a[contains(., "Sign in")] | //button[contains(., "Đăng nhập")]',
+                    )
+                )
+            )
+            sign_btn.click()
+        except:
+            pass  # Bỏ qua nếu form điền email hiện ra trực tiếp
+
+        # 2. Ô nhập Email (Sử dụng Selector linh hoạt cho Microsoft)
+        email_box = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'input[type="email"], input[name="loginfmt"]')
+            )
+        )
+        email_box.send_keys(email)
+        email_box.send_keys(Keys.RETURN)
+
+        time.sleep(3)
+        # ====== THÊM ĐOẠN NÀY VÀO ======
+        # Xử lý trường hợp Microsoft đòi gửi mã code, ép nó quay về dùng Mật khẩu
+        try:
+            use_pass_btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable(
+                    (
+                        By.XPATH,
+                        '//*[contains(text(), "Use your password") or contains(text(), "Sử dụng mật khẩu")]',
+                    )
                 )
             )
             use_pass_btn.click()
+            time.sleep(2)
         except:
-            pass
-
-        pass_input = wait.until(
-            EC.presence_of_element_located((By.ID, "passwordEntry"))
-        )
-        pass_input.send_keys(password)
-        pass_input.send_keys(Keys.RETURN)
-
+            pass  # Nếu màn hình đi thẳng tới ô mật khẩu thì cứ bỏ qua bước này
+        # ===============================
+        # ====== XỬ LÝ MÀN HÌNH "Sign in another way" -> CHỌN USE YOUR PASSWORD ======
         try:
+            # 1. Nếu có màn hình "Other ways to sign in" thì bấm trước
+            try:
+                other_ways_btn = WebDriverWait(driver, 4).until(
+                    EC.presence_of_element_located(
+                        (
+                            By.XPATH,
+                            '//*[contains(text(), "Other ways to sign in") or contains(text(), "Cách đăng nhập khác")]',
+                        )
+                    )
+                )
+                driver.execute_script("arguments[0].click();", other_ways_btn)
+                print("👉 Đã chọn: Other ways to sign in")
+                time.sleep(2)
+            except:
+                pass
+
+            # 2. Chọn dòng "Use your password" (Dùng JS click để không bị trượt)
+            use_pass_btn = WebDriverWait(driver, 6).until(
+                EC.presence_of_element_located(
+                    (
+                        By.XPATH,
+                        '//*[contains(text(), "Use your password") or contains(text(), "Sử dụng mật khẩu")]/ancestor::div[@role="button"] '
+                        '| //*[contains(text(), "Use your password") or contains(text(), "Sử dụng mật khẩu")]',
+                    )
+                )
+            )
+            driver.execute_script("arguments[0].click();", use_pass_btn)
+            print("👉 Đã kích hoạt: Use your password")
+            time.sleep(3)
+        except Exception as e:
+            print("ℹ️ Bỏ qua chọn phương thức (hoặc đã ở màn hình nhập pass):", e)
+        # ===========================================================================
+        # 3. Ô nhập Password
+        pass_box = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'input[type="password"], input[name="passwd"]')
+            )
+        )
+        pass_box.send_keys(password)
+        pass_box.send_keys(Keys.RETURN)
+
+        # 4. Xử lý nút "Stay signed in?" (Chọn No để không lưu đăng nhập)
+        try:
+            print("⏳ Đang xử lý màn hình Stay signed in...")
             no_btn = WebDriverWait(driver, 15).until(
                 EC.element_to_be_clickable(
-                    (By.CSS_SELECTOR, 'button[data-testid="secondaryButton"]')
+                    (
+                        By.XPATH,
+                        '//*[@id="declineButton"] | //*[@id="idBtn_Back"] | //*[@value="No"] | //button[contains(., "No")]',
+                    )
                 )
             )
             no_btn.click()
+            time.sleep(3)
         except:
+            print("⚠️ Không thấy màn hình Stay signed in, tiếp tục...")
             pass
 
-        print("✅ Đăng nhập thành công!")
+        print("✅ Đăng nhập thành công")
+
+        # Chờ giao diện Teams load hẳn
         time.sleep(15)
 
-        try:
-            extra_signin = driver.find_elements(
-                By.XPATH,
-                '//button[contains(., "Sign in") or contains(@aria-describedby, "signIn-title singIn-subtitle")]',
-            )
-            if len(extra_signin) > 0:
-                print("Phát hiện trang bắt Sign in tiếp theo...")
-                extra_signin[0].click()
-                print("Đã ấn nút Sign in")
-                time.sleep(10)
-
-                print("Bắt đầu ấn nút Retry")
-                actions = webdriver.ActionChains(driver)
-                actions.move_by_offset(500, 500).click().perform()
-                actions.send_keys(Keys.TAB).perform()
-                time.sleep(1)
-                actions.send_keys(Keys.ENTER).perform()
-                print("Đã ấn nút Retry")
-                time.sleep(20)
-            else:
-                print(
-                    "👉 Giao diện Teams đã load thẳng, không có popup chặn, tiếp tục công việc!"
-                )
-
-        except Exception as e:
-            print(f"⚠️ Bỏ qua lỗi check màn hình phụ: {e}")
-
-        driver.save_screenshot("after_login_success.png")
         return driver
 
     except Exception as e:
-        driver.save_screenshot("error_login.png")
-        print(f"❌ Lỗi đăng nhập chính: {e}")
-        driver.quit()
+        save_screenshot(driver, "login_error.png")
+        print("❌ Đăng nhập thất bại:", e)
+        try:
+            driver.quit()
+        except Exception:
+            pass
         return None
 
 
 if __name__ == "__main__":
+    # Khởi tạo kết nối Google Sheets
+    spreadsheet = None
+    sheet_names = []
+    try:
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        sheet_names = [s.title for s in spreadsheet.worksheets()]
+        print(f"✅ Kết nối Google Sheets thành công! Spreadsheet ID: {SPREADSHEET_ID}")
+    except Exception as e:
+        print(f"⚠️ Cảnh báo kết nối Google Sheets: {e}")
+
+    driver = None
     for attempt_login in range(5):
         driver = login()
         if driver:
-            print("login thành công")
+            print("✅ Đăng nhập Teams thành công!")
             break
         else:
             print(f"⚠️ Thử đăng nhập lại lần {attempt_login + 1}/5...")
             time.sleep(2)
 
-    time.sleep(5)
     if not driver:
-        print("❌ Đăng nhập không thành công!")
-        exit()  # Đảm bảo dừng chương trình nếu không đăng nhập được
+        print("❌ Đăng nhập Teams không thành công!")
+        exit(1)
 
-    driver.save_screenshot("after_login.png")
-    open_chat(driver, chat)
+    try:
+        driver.save_screenshot("after_login.png")
+        open_chat(driver, chat)
 
-    current_hour = datetime.datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).hour
+        current_hour = datetime.datetime.now(pytz.timezone("Asia/Ho_Chi_Minh")).hour
 
-    messages = get_filtered_messages(current_hour)
-    combined_msgs = combine_messages(messages)
+        if spreadsheet and sheet_names:
+            messages = get_filtered_messages(spreadsheet, sheet_names, current_hour)
+            combined_msgs = combine_messages(messages)
 
-    print(f"\n✅ Báo cáo lọc được lúc {current_hour}h:")
+            print(f"\n✅ Báo cáo lọc được lúc {current_hour}h:")
 
-    # Chỉ duyệt qua những sheet có dữ liệu, tối ưu logic gửi Teams
-    for sheet_name, msg_content in combined_msgs.items():
-        print(f"Testing\nSheet: [ {sheet_name} ]\nMessage: [ {msg_content} ]\n")
-        message = f"[ {sheet_name} ]\n" + msg_content
-        send_message(driver, message)
+            for sheet_name, msg_content in combined_msgs.items():
+                print(f"Testing\nSheet: [ {sheet_name} ]\nMessage: [ {msg_content} ]\n")
+                message = f"[ {sheet_name} ]\n" + msg_content
+                send_message(driver, message)
 
-    write_to_sheet("Report", messages)
-    write_to_sheet("GetReport", messages)
-
-    driver.quit()
-    print("✅ Hoàn tất toàn bộ công việc!")
+            write_to_sheet(spreadsheet, sheet_names, "Report", messages)
+            write_to_sheet(spreadsheet, sheet_names, "GetReport", messages)
+        else:
+            print("⚠️ Bỏ qua lọc và ghi báo cáo do không có kết nối Google Sheets.")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        print("✅ Hoàn tất toàn bộ công việc!")
