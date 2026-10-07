@@ -136,21 +136,94 @@ def send_message(driver, message):
 
 
 def open_chat(driver, chat_name):
+    """Mở nhóm chat an toàn bằng cả danh sách ngoài và thanh Filter bên trái."""
+    wait = WebDriverWait(driver, 20)
+    chat_item_xpath = (
+        '//*[contains(@data-tid, "chat-list-item") '
+        'or contains(@data-tid, "chat-item") '
+        'or @data-item-type="chat" '
+        'or @role="listitem" '
+        'or @role="treeitem"]'
+    )
+
     try:
-        # Đã dùng normalize-space để khớp 100% tên, chống gửi nhầm nhóm
-        chat_element = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable(
-                (By.XPATH, f"//span[normalize-space(text())='{chat_name}']")
+        # 1. Chờ danh sách nhóm xuất hiện
+        wait.until(EC.presence_of_element_located((By.XPATH, chat_item_xpath)))
+        groups = driver.find_elements(By.XPATH, chat_item_xpath)
+
+        for g in groups:
+            lines = [x.strip() for x in g.text.splitlines() if x.strip()]
+            if not lines:
+                continue
+
+            if lines[0] in ["Unread", "Chưa đọc"]:
+                lines.pop(0)
+
+            if not lines:
+                continue
+
+            txt = lines[0]
+            if not txt:
+                txt = g.get_attribute("aria-label") or ""
+
+            # Khớp tên chính xác hoặc tiền tố
+            if txt == chat_name or chat_name.startswith(txt.replace("...", "").strip()):
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", g)
+                time.sleep(1)
+                g.click()
+                time.sleep(3)
+                WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, '//div[@contenteditable="true"]'))
+                )
+                display_screenshot(driver, "after_opening_chat.png")
+                print(f"📂 Đã mở đúng nhóm: {chat_name}")
+                return True
+
+        print(f"⚠️ Không thấy {chat_name} ở danh sách ngoài, thử dùng thanh Filter...")
+
+        # 2. Bấm nút Filter (nếu ô tìm kiếm chưa mở)
+        try:
+            filter_icon_xpath = (
+                '//button[@data-testid="simple-collab-left-rail-header-sticky-filter-v2-button"]'
+                ' | //button[contains(@aria-keyshortcuts, "Ctrl+Shift+F")]'
             )
+            filter_icon = driver.find_element(By.XPATH, filter_icon_xpath)
+            driver.execute_script("arguments[0].click();", filter_icon)
+            time.sleep(1)
+        except Exception:
+            pass
+
+        # 3. Định vị ô input của thanh Filter
+        left_search_xpath = (
+            '//input[@data-testid="simple-collab-left-rail-sticky-filter-input"]'
+            ' | //input[@id="simple-collab-left-rail-sticky-filter-input-id"]'
+            ' | //input[contains(@placeholder, "Filter") or contains(@placeholder, "Lọc")]'
         )
-        chat_element.click()
+        search = wait.until(EC.presence_of_element_located((By.XPATH, left_search_xpath)))
+        search.click()
+        search.send_keys(Keys.CONTROL + "a")
+        search.send_keys(Keys.BACKSPACE)
+        search.send_keys(chat_name)
+        time.sleep(3)
+
+        # 4. Bấm vào kết quả sau khi lọc
+        filtered_result_xpath = f"//span[normalize-space(text())='{chat_name}']"
+        filtered_result = wait.until(
+            EC.presence_of_element_located((By.XPATH, filtered_result_xpath))
+        )
+        driver.execute_script("arguments[0].click();", filtered_result)
+        time.sleep(3)
         WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.XPATH, '//div[@contenteditable="true"]'))
         )
         display_screenshot(driver, "after_opening_chat.png")
+        print(f"📂 Đã mở nhóm qua thanh Filter: {chat_name}")
+        return True
+
     except Exception as e:
         display_screenshot(driver, "open_chat_error.png")
         print(f"❌ Lỗi khi mở chat '{chat_name}': {e}")
+        return False
 
 
 def combine_messages(messages_dict):
@@ -307,12 +380,14 @@ def write_to_sheet(spreadsheet, sheet_names, sheet_target_name, messages):
     except Exception as e:
         print(f"❌ Lỗi khi ghi vào sheet {sheet_target_name}: {e}")
 # =========================
-# Kiểm tra version Chrome
+# Kiểm tra version & binary Browser
 # =========================       
-def get_installed_chrome_major_version():
-    """Tự động kiểm tra Major Version của Chrome trên máy"""
-
+def get_browser_binary_and_version():
+    """Tự động kiểm tra đường dẫn binary và Major Version của trình duyệt."""
     system = platform.system()
+    binary_path = None
+    major_version = None
+
     try:
         if system == "Windows":
             import winreg
@@ -322,24 +397,42 @@ def get_installed_chrome_major_version():
             except FileNotFoundError:
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Google\Chrome\BLBeacon")
             version, _ = winreg.QueryValueEx(key, "version")
-            return int(version.split('.')[0])
+            major_version = int(version.split('.')[0])
 
         elif system == "Linux":
-            output = subprocess.check_output(["google-chrome", "--version"]).decode("utf-8")
-            match = re.search(r"Google Chrome (\d+)\.", output)
-            if match:
-                return int(match.group(1))
+            for cmd_name in ["google-chrome", "brave-browser", "chromium"]:
+                try:
+                    output = subprocess.check_output([cmd_name, "--version"]).decode("utf-8")
+                    match = re.search(r"(\d+)\.", output)
+                    if match:
+                        major_version = int(match.group(1))
+                        break
+                except Exception:
+                    pass
 
         elif system == "Darwin":  # macOS
-            cmd = r"/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --version"
-            output = subprocess.check_output(cmd, shell=True).decode("utf-8")
-            match = re.search(r"Google Chrome (\d+)\.", output)
-            if match:
-                return int(match.group(1))
+            candidates = [
+                ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", r"Google Chrome (\d+)\."),
+                ("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", r"Brave Browser (\d+)\."),
+                ("/Applications/Chromium.app/Contents/MacOS/Chromium", r"Chromium (\d+)\."),
+                ("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge", r"Microsoft Edge (\d+)\.")
+            ]
+            for path, regex in candidates:
+                if os.path.exists(path):
+                    binary_path = path
+                    try:
+                        output = subprocess.check_output([path, "--version"]).decode("utf-8")
+                        match = re.search(regex, output)
+                        if match:
+                            major_version = int(match.group(1))
+                        break
+                    except Exception as e:
+                        print(f"⚠️ Không lấy được version của {path}: {e}")
+
     except Exception as e:
-        print(f"⚠️ Không thể tự động phát hiện phiên bản Chrome: {e}")
+        print(f"⚠️ Không thể tự động phát hiện phiên bản trình duyệt: {e}")
     
-    return None
+    return binary_path, major_version
 
 
 
@@ -357,6 +450,7 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     options.page_load_strategy = "eager"
     options.add_argument("--lang=en-GB")
+    options.add_argument("--disable-features=WebAuthentication,WebAuthenticationUI")
     
     prefs = {
         "profile.cookie_controls_mode": 0,
@@ -370,23 +464,21 @@ def get_driver():
     if proxy_url:
         options.add_argument(f"--proxy-server={proxy_url}")
 
-    import subprocess
-    import re
-
-    chrome_version = None
-    try:
-        result = subprocess.check_output(["google-chrome", "--version"]).decode("utf-8")
-        chrome_version = int(re.search(r"\d+", result).group(0))
-        print(
-            f"✅ Đã tự động nhận diện Chrome trên máy chủ là version: {chrome_version}"
-        )
-    except Exception:
-        chrome_version = get_installed_chrome_major_version()
+    binary_path, chrome_version = get_browser_binary_and_version()
+    if binary_path:
+        print(f"🌐 Sử dụng trình duyệt: {binary_path}")
+        options.binary_location = binary_path
 
     if chrome_version:
-        driver = uc.Chrome(options=options, version_main=chrome_version)
-    else:
-        driver = uc.Chrome(options=options)
+        print(f"✅ Đã nhận diện phiên bản trình duyệt: {chrome_version}")
+
+    kwargs = {"options": options}
+    if chrome_version:
+        kwargs["version_main"] = chrome_version
+    if binary_path:
+        kwargs["browser_executable_path"] = binary_path
+
+    driver = uc.Chrome(**kwargs)
 
     driver.execute_cdp_cmd(
         "Page.addScriptToEvaluateOnNewDocument",
